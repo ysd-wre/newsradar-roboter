@@ -1,0 +1,37 @@
+name: NewsRadar-Roboter
+
+on:
+  schedule:
+    - cron: "23 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency: roboter
+
+jobs:
+  lauf:
+    runs-on: macos-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - name: Bauen
+        run: swiftc -parse-as-library -swift-version 5 -O *.swift -o /tmp/roboter
+      - name: Nachrichten aktualisieren
+        env:
+          ZIEL_PROJEKT: ysd-wre/newsradar
+          ZIEL_SCHLUESSEL: ${{ secrets.ZIEL_SCHLUESSEL }}
+          LESEPASSWORT: ${{ secrets.LESEPASSWORT }}
+        run: /tmp/roboter
+      # GitHub schaltet Zeitpläne nach 60 Tagen ohne Änderung ab. Darum gelegentlich ein Lebenszeichen.
+      - name: Lebenszeichen
+        run: |
+          if [ $(( $(date +%s) - $(git log -1 --format=%ct) )) -gt 1728000 ]; then
+            date > lebenszeichen.txt
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add lebenszeichen.txt
+            git commit -m "Lebenszeichen"
+            git push
+          fi
