@@ -745,7 +745,7 @@ enum Roboter {
               let baum = (i["tree"] as? [String: Any])?["sha"] as? String,
               let zeit = ((i["committer"] as? [String: Any])?["date"] as? String).flatMap({ ISO8601DateFormatter().date(from: $0) })
         else { throw Online.Fehler(text: "Die Online-App wurde nicht gefunden (Fehler \(c)).") }
-        if i["message"] as? String != kennung, jetzt.timeIntervalSince(zeit) < ruhe { return "Der Mac ist aktiv. Nichts zu tun." }
+        if wert("GITHUB_EVENT_NAME") != "workflow_dispatch", i["message"] as? String != kennung, jetzt.timeIntervalSince(zeit) < ruhe { return "Der Mac ist aktiv. Nichts zu tun." }
 
         let alt = try Online.entschluesselt(try await holeNachrichten(p, baum, token), passwort: passwort)
         let ergebnisse = await Feeds.holeAlle(Quelle.vorgabe, suchthemen: [], marken: Marken())
