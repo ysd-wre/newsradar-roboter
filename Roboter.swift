@@ -540,6 +540,48 @@ struct Buendler {
     }
 }
 
+// ===== Neueste.swift =====
+import Foundation
+
+/// „Neueste“: jedes Thema nur einmal, das Neueste oben. Ein Thema zählt, sobald die zweite Redaktion berichtet; diese Uhrzeit bestimmt den Platz.
+/// Gehört auch zum Roboter. Die Online-App bekommt die Uhrzeit als Feld `neu` und rechnet nur ersatzweise selbst (neueste in Webseite/app.js).
+struct Neueste: Identifiable {
+    let thema: Thema
+    let zeit: Date
+    var id: String { thema.id }
+
+    /// Wann die zweite Redaktion dazukam. Nur sichere Uhrzeiten, nichts aus der Zukunft.
+    static func zweite(_ meldungen: [Schlagzeile], jetzt: Date = Date()) -> Date? {
+        var erste: [String: Date] = [:]
+        for m in meldungen where m.suchthema == nil && m.zeitUnsicher != true && m.datum <= jetzt.addingTimeInterval(600) {
+            erste[m.quelle] = min(erste[m.quelle] ?? m.datum, m.datum)
+        }
+        return erste.count >= 2 ? erste.values.sorted()[1] : nil
+    }
+
+    private static func woerter(_ t: Thema) -> Set<String> { Set(Text.woerter(Text.dachzeile(t.titel).1)) }
+    /// Dasselbe Thema in zwei Bündeln: mindestens zwei gemeinsame Wörter, und die machen mindestens die Hälfte der kürzeren Überschrift aus.
+    static func gleich(_ a: Set<String>, _ b: Set<String>) -> Bool {
+        let n = a.intersection(b).count
+        return n >= 2 && n * 2 >= min(a.count, b.count)
+    }
+
+    static func liste(_ themen: [Thema], jetzt: Date = Date()) -> [Neueste] {
+        var gesehen: [Set<String>] = []
+        return themen.compactMap { t -> Neueste? in
+            guard t.artikel != nil, let z = zweite(t.meldungen, jetzt: jetzt), jetzt.timeIntervalSince(z) < 24 * 3600 else { return nil }
+            return Neueste(thema: t, zeit: z)
+        }
+        .sorted { $0.zeit != $1.zeit ? $0.zeit > $1.zeit : $0.id < $1.id }
+        .filter { n in
+            let w = woerter(n.thema)
+            if gesehen.contains(where: { gleich($0, w) }) { return false }
+            gesehen.append(w)
+            return true
+        }
+    }
+}
+
 // ===== Online.swift =====
 import CommonCrypto
 import CryptoKit
@@ -555,6 +597,7 @@ struct OnlineStand: Codable {
     var salz = Data()
     var pruefsumme = ""              // zuletzt hochgeladener Inhalt
     var letzterUpload: Date?
+    var huelle: String?              // Fassung der Online-App, die zuletzt hochgeladen wurde
 
     var adresse: String { projekt.lowercased() == "\(besitzer).github.io".lowercased() ? "https://\(besitzer.lowercased()).github.io/" : "https://\(besitzer.lowercased()).github.io/\(projekt)/" }
 }
@@ -567,17 +610,31 @@ enum Online {
 
     struct Paket: Codable {
         struct M: Codable { let q: String, t: String, l: String, z: Date?, a: String? }
-        struct A: Codable { let id: String, titel: String, absaetze: [String], ressort: String, signal: Int, zeit: Date, geschrieben: Date, meldungen: [M] }
+        struct A: Codable { let id: String, titel: String, absaetze: [String], ressort: String, signal: Int, zeit: Date, geschrieben: Date, meldungen: [M], kurve: [Int]?, neu: Date? }
         let stand: Date, artikel: [A], schlagzeilen: [M]
+    }
+    /// Redaktionen je Stunde, die letzten 24 Stunden, älteste zuerst. Ebenso in Webseite/app.js (kurvenwerte).
+    static func kurve(_ meldungen: [Schlagzeile], jetzt: Date = Date()) -> [Int] {
+        var stunden = Array(repeating: Set<String>(), count: 24)
+        for m in meldungen where m.suchthema == nil && m.zeitUnsicher != true {
+            let h = max(0, Int((jetzt.timeIntervalSince(m.datum) / 3600).rounded(.down)))
+            if h < 24 { stunden[23 - h].insert(m.quelle) }
+        }
+        return stunden.map(\.count)
     }
     static func inhalt(_ themen: [Thema], jetzt: Date = Date()) -> (daten: Data, pruefsumme: String, anzahl: Int) {
         func m(_ s: Schlagzeile, _ anriss: Bool) -> Paket.M { .init(q: s.quelle, t: s.titel, l: s.link, z: s.zeitUnsicher == true ? nil : s.datum, a: anriss && !s.anriss.isEmpty ? String(s.anriss.prefix(260)) : nil) }
-        let auswahl = themen.filter { $0.artikel != nil && jetzt.timeIntervalSince($0.letzteMeldung) < 48 * 3600 }
-            .sorted { $0.gewicht(jetzt: jetzt) > $1.gewicht(jetzt: jetzt) }.prefix(80)
+        // Die 80 wichtigsten und die 60 neuesten Themen
+        let gewichtet = themen.filter { $0.artikel != nil && jetzt.timeIntervalSince($0.letzteMeldung) < 48 * 3600 }
+            .sorted { $0.gewicht(jetzt: jetzt) > $1.gewicht(jetzt: jetzt) }
+        let neueste = Neueste.liste(themen, jetzt: jetzt)
+        let neuZeit = Dictionary(neueste.map { ($0.id, $0.zeit) }, uniquingKeysWith: { a, _ in a })
+        let dabei = Set(gewichtet.prefix(80).map(\.id)).union(neueste.prefix(60).map(\.id))
+        let auswahl = gewichtet.filter { dabei.contains($0.id) }
         let artikel = auswahl.map { t -> Paket.A in
             let a = t.artikel!
             return .init(id: t.id, titel: a.titel, absaetze: a.absaetze, ressort: t.ressort.rawValue, signal: t.unabhaengig, zeit: t.letzteMeldung, geschrieben: a.geschrieben,
-                         meldungen: t.meldungen.filter { $0.suchthema == nil }.sorted { $0.datum > $1.datum }.prefix(25).map { m($0, !a.ausKI) })
+                         meldungen: t.meldungen.filter { $0.suchthema == nil }.sorted { $0.datum > $1.datum }.prefix(25).map { m($0, !a.ausKI) }, kurve: kurve(t.meldungen, jetzt: jetzt), neu: neuZeit[t.id])
         }
         let zeilen = themen.flatMap(\.meldungen).filter { $0.suchthema == nil }.sorted { $0.datum > $1.datum }.prefix(300).map { m($0, false) }
         let k = JSONEncoder()
@@ -595,6 +652,8 @@ enum Online {
         for f in (try? FileManager.default.contentsOfDirectory(at: ordner, includingPropertiesForKeys: nil)) ?? [] where !f.lastPathComponent.hasPrefix(".") { d[f.lastPathComponent] = try? Data(contentsOf: f) }
         return d
     }
+
+    static func huelleSumme() -> String { let h = huelle(); return summe(Data(h.keys.sorted().map { $0 + summe(h[$0]!) }.joined().utf8)) }
 
     // MARK: Verschlüsseln
 
@@ -674,6 +733,7 @@ enum Online {
         let n = inhalt(themen)
         let feste = huelle()
         let gesamt = summe(Data((n.pruefsumme + s.salz.base64EncodedString() + feste.keys.sorted().map { summe(feste[$0]!) }.joined()).utf8))
+        s.huelle = huelleSumme()
         guard gesamt != s.pruefsumme else { s.letzterUpload = Date(); return s }
         let p = "/repos/\(s.besitzer)/\(s.projekt)"
         let salz = s.salz
