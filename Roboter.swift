@@ -598,6 +598,7 @@ struct OnlineStand: Codable {
     var pruefsumme = ""              // zuletzt hochgeladener Inhalt
     var letzterUpload: Date?
     var huelle: String?              // Fassung der Online-App, die zuletzt hochgeladen wurde
+    var videos: String?              // Prüfsumme der zuletzt hochgeladenen Videos (Online.Zusatz)
 
     var adresse: String { projekt.lowercased() == "\(besitzer).github.io".lowercased() ? "https://\(besitzer.lowercased()).github.io/" : "https://\(besitzer.lowercased()).github.io/\(projekt)/" }
 }
@@ -609,7 +610,7 @@ enum Online {
     // MARK: Inhalt
 
     struct Paket: Codable {
-        struct M: Codable { let q: String, t: String, l: String, z: Date?, a: String? }
+        struct M: Codable { let q: String, t: String, l: String, z: Date?, a: String?, r: String? }   // r: Ressort, nur bei den Schlagzeilen (für den Roboter)
         struct A: Codable { let id: String, titel: String, absaetze: [String], ressort: String, signal: Int, zeit: Date, geschrieben: Date, meldungen: [M], kurve: [Int]?, neu: Date? }
         let stand: Date, artikel: [A], schlagzeilen: [M]
     }
@@ -622,13 +623,16 @@ enum Online {
         }
         return stunden.map(\.count)
     }
-    static func inhalt(_ themen: [Thema], jetzt: Date = Date()) -> (daten: Data, pruefsumme: String, anzahl: Int) {
-        func m(_ s: Schlagzeile, _ anriss: Bool) -> Paket.M { .init(q: s.quelle, t: s.titel, l: s.link, z: s.zeitUnsicher == true ? nil : s.datum, a: anriss && !s.anriss.isEmpty ? String(s.anriss.prefix(260)) : nil) }
-        // Die 80 wichtigsten und die 60 neuesten Themen
-        let gewichtet = themen.filter { $0.artikel != nil && jetzt.timeIntervalSince($0.letzteMeldung) < 48 * 3600 }
+    /// `frueher`: Uhrzeiten für „Neueste“ aus dem letzten Stand. Der Roboter kennt je Thema nur die 25 neuesten Berichte; die frühere Zeit gilt.
+    static func inhalt(_ themen: [Thema], jetzt: Date = Date(), frueher: [String: Date] = [:]) -> (daten: Data, pruefsumme: String, anzahl: Int) {
+        func m(_ s: Schlagzeile, _ anriss: Bool, ressort: Bool = false) -> Paket.M {
+            .init(q: s.quelle, t: s.titel, l: s.link, z: s.zeitUnsicher == true ? nil : s.datum, a: anriss && !s.anriss.isEmpty ? String(s.anriss.prefix(260)) : nil, r: ressort ? s.ressort?.rawValue : nil)
+        }
+        // Die 80 wichtigsten und die 60 neuesten Themen. Themen nur aus „Meine Themen“ bleiben auf dem Mac.
+        let gewichtet = themen.filter { $0.artikel != nil && jetzt.timeIntervalSince($0.letzteMeldung) < 48 * 3600 && $0.meldungen.contains { $0.suchthema == nil } }
             .sorted { $0.gewicht(jetzt: jetzt) > $1.gewicht(jetzt: jetzt) }
         let neueste = Neueste.liste(themen, jetzt: jetzt)
-        let neuZeit = Dictionary(neueste.map { ($0.id, $0.zeit) }, uniquingKeysWith: { a, _ in a })
+        let neuZeit = Dictionary(neueste.map { ($0.id, min($0.zeit, frueher[$0.id] ?? $0.zeit)) }, uniquingKeysWith: { a, _ in a })
         let dabei = Set(gewichtet.prefix(80).map(\.id)).union(neueste.prefix(60).map(\.id))
         let auswahl = gewichtet.filter { dabei.contains($0.id) }
         let artikel = auswahl.map { t -> Paket.A in
@@ -636,7 +640,7 @@ enum Online {
             return .init(id: t.id, titel: a.titel, absaetze: a.absaetze, ressort: t.ressort.rawValue, signal: t.unabhaengig, zeit: t.letzteMeldung, geschrieben: a.geschrieben,
                          meldungen: t.meldungen.filter { $0.suchthema == nil }.sorted { $0.datum > $1.datum }.prefix(25).map { m($0, !a.ausKI) }, kurve: kurve(t.meldungen, jetzt: jetzt), neu: neuZeit[t.id])
         }
-        let zeilen = themen.flatMap(\.meldungen).filter { $0.suchthema == nil }.sorted { $0.datum > $1.datum }.prefix(300).map { m($0, false) }
+        let zeilen = themen.flatMap(\.meldungen).filter { $0.suchthema == nil }.sorted { $0.datum > $1.datum }.prefix(300).map { m($0, false, ressort: true) }
         let k = JSONEncoder()
         k.dateEncodingStrategy = .iso8601
         k.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
@@ -654,6 +658,14 @@ enum Online {
     }
 
     static func huelleSumme() -> String { let h = huelle(); return summe(Data(h.keys.sorted().map { $0 + summe(h[$0]!) }.joined().utf8)) }
+
+    /// Weitere Dateien, die nur der Mac hochlädt (Videos). Der Roboter lässt sie liegen, wie sie sind.
+    /// `liste` geht verschlüsselt als videos.json hoch. `dateien` (Pfad → mit dem Schlüssel verschlüsselter Inhalt) gehen nur hoch, wenn es sie online unter dem Namen noch nicht gibt.
+    struct Zusatz {
+        var liste = Data("[]".utf8)
+        var dateien: [String: (SymmetricKey) throws -> Data] = [:]
+        var summe: String { Online.summe(liste + Data(dateien.keys.sorted().joined(separator: "|").utf8)) }
+    }
 
     // MARK: Verschlüsseln
 
@@ -674,9 +686,10 @@ enum Online {
         return SymmetricKey(data: k)
     }
     /// Erst packen, dann mit AES-256-GCM verschlüsseln. Ohne Passwort ist die Datei nur Zufall.
-    static func verschluesselt(_ d: Data, passwort: String, salz: Data) throws -> Data {
+    static func verschluesselt(_ d: Data, passwort: String, salz: Data) throws -> Data { try verschluesselt(d, schluessel: schluessel(passwort, salz), salz: salz) }
+    static func verschluesselt(_ d: Data, schluessel k: SymmetricKey, salz: Data) throws -> Data {
         let gepackt = try (d as NSData).compressed(using: .zlib) as Data
-        let kiste = try AES.GCM.seal(gepackt, using: schluessel(passwort, salz))
+        let kiste = try AES.GCM.seal(gepackt, using: k)
         return try JSONSerialization.data(withJSONObject: ["v": 1, "runden": runden, "salz": salz.base64EncodedString(),
             "iv": Data(kiste.nonce).base64EncodedString(), "daten": (kiste.ciphertext + kiste.tag).base64EncodedString()], options: [.sortedKeys])
     }
@@ -695,9 +708,19 @@ enum Online {
 
     // MARK: Hochladen
 
-    static func anfrage(_ art: String, _ pfad: String, _ token: String, _ inhalt: [String: Any]? = nil) async throws -> (Int, [String: Any]) {
+    /// Für große Dateien (Videos): Bei langsamem Internet dauert eine einzelne Datei einige Minuten.
+    private static let lang: URLSession = {
+        let k = URLSessionConfiguration.ephemeral
+        k.timeoutIntervalForRequest = 120
+        k.timeoutIntervalForResource = 30 * 60
+        k.httpShouldSetCookies = false
+        k.httpCookieAcceptPolicy = .never
+        return URLSession(configuration: k)
+    }()
+
+    static func anfrage(_ art: String, _ pfad: String, _ token: String, _ inhalt: [String: Any]? = nil, lange: Bool = false) async throws -> (Int, [String: Any]) {
         guard let u = URL(string: basis + pfad) else { throw Fehler(text: "Benutzername oder Projektname enthält ungültige Zeichen.") }
-        var a = URLRequest(url: u, timeoutInterval: 30)
+        var a = URLRequest(url: u, timeoutInterval: lange ? 120 : 30)
         a.httpMethod = art
         a.setValue("Bearer " + token, forHTTPHeaderField: "Authorization")
         a.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
@@ -705,14 +728,14 @@ enum Online {
         a.setValue("NewsRadar/1.0", forHTTPHeaderField: "User-Agent")
         if let inhalt { a.httpBody = try JSONSerialization.data(withJSONObject: inhalt); a.setValue("application/json", forHTTPHeaderField: "Content-Type") }
         let d: Data, r: URLResponse
-        do { (d, r) = try await Feeds.sitzung.data(for: a) } catch { throw Fehler(text: "GitHub ist gerade nicht erreichbar. Prüfe deine Internetverbindung.") }
+        do { (d, r) = try await (lange ? lang : Feeds.sitzung).data(for: a) } catch { throw Fehler(text: "GitHub ist gerade nicht erreichbar. Prüfe deine Internetverbindung.") }
         let code = (r as? HTTPURLResponse)?.statusCode ?? 0
         if code == 401 { throw Fehler(text: "Der Zugangsschlüssel ist ungültig oder abgelaufen.") }
         if code == 403 || code == 429 { throw Fehler(text: "Der Zugangsschlüssel darf nicht schreiben. Gib ihm bei „Contents“ das Recht „Read and write“.") }
         return (code, (try? JSONSerialization.jsonObject(with: d) as? [String: Any]) ?? [:])
     }
-    static func verlange(_ art: String, _ pfad: String, _ token: String, _ inhalt: [String: Any], _ feld: String) async throws -> String {
-        let (c, a) = try await anfrage(art, pfad, token, inhalt)
+    static func verlange(_ art: String, _ pfad: String, _ token: String, _ inhalt: [String: Any], _ feld: String, lange: Bool = false) async throws -> String {
+        let (c, a) = try await anfrage(art, pfad, token, inhalt, lange: lange)
         guard (200..<300).contains(c), let w = a[feld] as? String else { throw Fehler(text: "Hochladen fehlgeschlagen (Fehler \(c)).") }
         return w
     }
@@ -728,33 +751,56 @@ enum Online {
     }
 
     /// Ersetzt den kompletten Inhalt durch einen einzigen neuen Stand. Es bleibt kein Verlauf alter Meldungen.
-    static func ladeHoch(_ themen: [Thema], _ stand: OnlineStand, token: String, passwort: String) async throws -> OnlineStand {
+    static func ladeHoch(_ themen: [Thema], _ stand: OnlineStand, token: String, passwort: String, zusatz: Zusatz = Zusatz()) async throws -> OnlineStand {
         var s = stand
         let n = inhalt(themen)
         let feste = huelle()
-        let gesamt = summe(Data((n.pruefsumme + s.salz.base64EncodedString() + feste.keys.sorted().map { summe(feste[$0]!) }.joined()).utf8))
+        let gesamt = summe(Data((n.pruefsumme + s.salz.base64EncodedString() + feste.keys.sorted().map { summe(feste[$0]!) }.joined() + zusatz.summe).utf8))
         s.huelle = huelleSumme()
-        guard gesamt != s.pruefsumme else { s.letzterUpload = Date(); return s }
+        guard gesamt != s.pruefsumme else { s.letzterUpload = Date(); s.videos = zusatz.summe; return s }
         let p = "/repos/\(s.besitzer)/\(s.projekt)"
-        let salz = s.salz
-        let geheim = try await Task.detached { try verschluesselt(n.daten, passwort: passwort, salz: salz) }.value
+        let salz = s.salz, liste = zusatz.liste
+        let (k, geheim, geheimeListe) = try await Task.detached { () throws -> (SymmetricKey, Data, Data) in
+            let k = schluessel(passwort, salz)
+            return (k, try verschluesselt(n.daten, schluessel: k, salz: salz), try verschluesselt(liste, schluessel: k, salz: salz))
+        }.value
 
         // Ein ganz leeres Projekt braucht zuerst irgendeine Datei
-        let (da, _) = try await anfrage("GET", p + "/git/ref/heads/\(s.zweig)", token)
+        let (da, kopf) = try await anfrage("GET", p + "/git/ref/heads/\(s.zweig)", token)
         if da == 404 || da == 409 {
             let (c, _) = try await anfrage("PUT", p + "/contents/.nojekyll", token, ["message": "Start", "content": Data("\n".utf8).base64EncodedString(), "branch": s.zweig])
             guard c == 200 || c == 201 || c == 422 else { throw Fehler(text: "Das Projekt ließ sich nicht vorbereiten (Fehler \(c)).") }
         }
+        // Große Dateien, die schon online liegen, nicht noch einmal hochladen
+        var vorhanden: [String: String] = [:]
+        if !zusatz.dateien.isEmpty, da == 200, let c = (kopf["object"] as? [String: Any])?["sha"] as? String {
+            let (_, commit) = try await anfrage("GET", p + "/git/commits/\(c)", token)
+            if let t = (commit["tree"] as? [String: Any])?["sha"] as? String {
+                let (_, b) = try await anfrage("GET", p + "/git/trees/\(t)?recursive=1", token)
+                for e in b["tree"] as? [[String: Any]] ?? [] where e["type"] as? String == "blob" {
+                    if let pfad = e["path"] as? String, let sha = e["sha"] as? String { vorhanden[pfad] = sha }
+                }
+            }
+        }
         var baum: [[String: Any]] = []
-        for (name, d) in feste.merging(["news.json": geheim], uniquingKeysWith: { _, b in b }).sorted(by: { $0.key < $1.key }) {
+        for (name, d) in feste.merging(["news.json": geheim, "videos.json": geheimeListe], uniquingKeysWith: { _, b in b }).sorted(by: { $0.key < $1.key }) {
             let sha = try await verlange("POST", p + "/git/blobs", token, ["content": d.base64EncodedString(), "encoding": "base64"], "sha")
             baum.append(["path": name, "mode": "100644", "type": "blob", "sha": sha])
+        }
+        for (pfad, mache) in zusatz.dateien.sorted(by: { $0.key < $1.key }) {
+            var sha = vorhanden[pfad]
+            if sha == nil {
+                let d = try await Task.detached { try mache(k) }.value
+                sha = try await verlange("POST", p + "/git/blobs", token, ["content": d.base64EncodedString(), "encoding": "base64"], "sha", lange: true)
+            }
+            baum.append(["path": pfad, "mode": "100644", "type": "blob", "sha": sha!])
         }
         let tree = try await verlange("POST", p + "/git/trees", token, ["tree": baum], "sha")
         let commit = try await verlange("POST", p + "/git/commits", token, ["message": "Aktueller Stand", "tree": tree, "parents": [String](), "author": absender, "committer": absender], "sha")
         _ = try await verlange("PATCH", p + "/git/refs/heads/\(s.zweig)", token, ["sha": commit, "force": true], "ref")
         s.pruefsumme = gesamt
         s.letzterUpload = Date()
+        s.videos = zusatz.summe
         return s
     }
 }
@@ -811,7 +857,7 @@ enum Roboter {
         let ergebnisse = await Feeds.holeAlle(Quelle.vorgabe, suchthemen: [], marken: Marken())
         guard ergebnisse.contains(where: { $0.fehler == nil }) else { throw Online.Fehler(text: "Keine Quelle erreichbar.") }
         let themen = neuerStand(alt.paket, ergebnisse.flatMap(\.meldungen), jetzt: jetzt)
-        let n = Online.inhalt(themen, jetzt: jetzt)
+        let n = inhalt(alt.paket, themen, jetzt: jetzt)
         let geheim = try Online.verschluesselt(n.daten, passwort: passwort, salz: alt.salz)
 
         // Nur die Nachrichten ersetzen; die übrigen Dateien der Online-App bleiben, wie der Mac sie hochgeladen hat.
@@ -833,6 +879,11 @@ enum Roboter {
         return daten
     }
 
+    /// Der neue Inhalt. Die Uhrzeit für „Neueste“ aus dem alten Stand bleibt, wenn sie früher ist: Der Roboter kennt nur die 25 neuesten Berichte je Thema.
+    static func inhalt(_ alt: Online.Paket, _ themen: [Thema], jetzt: Date) -> (daten: Data, pruefsumme: String, anzahl: Int) {
+        Online.inhalt(themen, jetzt: jetzt, frueher: Dictionary(alt.artikel.compactMap { a in a.neu.map { (a.id, $0) } }, uniquingKeysWith: min))
+    }
+
     /// Baut aus dem bisherigen Stand und den frischen Schlagzeilen den neuen Stand. Texte vom Mac bleiben erhalten.
     static func neuerStand(_ p: Online.Paket, _ frische: [Schlagzeile], jetzt: Date) -> [Thema] {
         func s(_ m: Online.Paket.M, _ zeit: Date, _ r: Ressort?) -> Schlagzeile {
@@ -845,8 +896,8 @@ enum Roboter {
         }
         let grenze = jetzt.addingTimeInterval(-36 * 3600)
         var links = Set(alt.flatMap(\.meldungen).map(\.link)), titel = Set(alt.flatMap(\.meldungen).map { $0.quelle + "|" + $0.titel })
-        // Frische zuerst, sie haben auch Anriss und Ressort
-        let neu = (frische + p.schlagzeilen.map { s($0, p.stand, nil) })
+        // Frische zuerst, sie haben auch Anriss. Alte Schlagzeilen ohne sichere Uhrzeit nicht wieder aufnehmen, sonst werden sie nie alt.
+        let neu = (frische + p.schlagzeilen.filter { $0.z != nil }.map { s($0, p.stand, $0.r.flatMap { Ressort(rawValue: $0) }) })
             .filter { $0.datum > grenze && links.insert($0.link).inserted && titel.insert($0.quelle + "|" + $0.titel).inserted }
             .sorted { $0.datum < $1.datum }
         let ruhend = alt.filter { $0.letzteMeldung <= grenze }
